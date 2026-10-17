@@ -1,0 +1,36 @@
+pipeline {
+    agent {
+        kubernetes {
+            yamlFile 'ci/jenkins/pod-templates/terraform-agent.yaml'
+        }
+    }
+
+    options {
+        disableConcurrentBuilds()
+        timestamps()
+        skipDefaultCheckout()
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Validate') {
+            steps {
+                sh 'ci/jenkins/scripts/terraform-check.sh'
+            }
+        }
+
+        stage('Plan') {
+            when {
+                changeRequest()
+            }
+            steps {
+                sh 'ci/jenkins/scripts/terraform-plan.sh'
+            }
+        }
+    }
+}
