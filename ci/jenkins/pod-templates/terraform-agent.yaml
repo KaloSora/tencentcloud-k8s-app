@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: jenkins-agent
+  containers:
+    - name: jnlp
+      image: jenkins/inbound-agent:latest-jdk17
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+
+    - name: maven
+      image: maven:3.9-eclipse-temurin-21
+      command: ["sleep"]
+      args: ["99d"]
+
+    - name: kaniko
+      image: gcr.io/kaniko-project/executor:debug
+      command: ["/busybox/sh", "-c"]
+      args: ["cat"]
+      tty: true
+      volumeMounts:
+        - name: docker-config
+          mountPath: /kaniko/.docker
+
+    - name: git
+      image: alpine/git:latest
+      command: ["sleep"]
+      args: ["99d"]
+
+  volumes:
+    - name: docker-config
+      secret:
+        secretName: harbor-docker-config
