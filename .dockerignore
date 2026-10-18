@@ -5,4 +5,5 @@
 build
 ci
 k8s
+charts
 README.md
