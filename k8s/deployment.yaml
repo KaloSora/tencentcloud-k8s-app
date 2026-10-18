@@ -23,10 +23,10 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
-              containerPort: 8080
+              containerPort: 18080
           env:
             - name: PORT
-              value: "8080"
+              value: "18080"
           readinessProbe:
             httpGet:
               path: /readyz

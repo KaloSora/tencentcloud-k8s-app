@@ -17,17 +17,17 @@ Requires JDK 11 or later:
 ```sh
 ./scripts/test.sh
 java -jar build/app.jar
-curl http://localhost:8080/healthz
+curl http://localhost:18080/healthz
 ```
 
-Use the `PORT` environment variable to change the listening port.
+The application listens on port `18080` by default. Use the `PORT` environment variable to change the listening port.
 
 ## Build and Run the Container Image
 
 ```sh
 docker build -t k8s-demo-app:local .
-docker run --rm -p 8080:8080 k8s-demo-app:local
-curl http://localhost:8080/
+docker run --rm -p 18080:18080 k8s-demo-app:local
+curl http://localhost:18080/
 ```
 
 The image uses a multi-stage build and runs as a non-root user with UID `10001`.
@@ -63,9 +63,9 @@ Configure replicas, ports, and resource limits in `values.yaml`, or supply envir
 To check the application after installation:
 
 ```sh
-kubectl -n demo port-forward service/k8s-demo-app 8080:80
+kubectl -n demo port-forward service/k8s-demo-app 18080:80
 # In another terminal:
-curl http://localhost:8080/healthz
+curl http://localhost:18080/healthz
 ```
 
 Use a separate release name or namespace when testing alongside an existing deployment. Helm does not automatically adopt resources previously created with `kubectl apply`.

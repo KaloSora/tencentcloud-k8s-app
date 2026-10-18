@@ -12,8 +12,8 @@ WORKDIR /app
 COPY --from=builder --chown=app:app /workspace/build/app.jar ./app.jar
 
 USER app
-EXPOSE 8080
-ENV PORT=8080
+EXPOSE 18080
+ENV PORT=18080
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD wget -q -O /dev/null "http://127.0.0.1:${PORT}/healthz" || exit 1

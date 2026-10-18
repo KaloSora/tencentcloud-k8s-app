@@ -39,7 +39,7 @@ public final class App {
     }
 
     private static int readPort() {
-        String value = System.getenv().getOrDefault("PORT", "8080");
+        String value = System.getenv().getOrDefault("PORT", "18080");
         try {
             int port = Integer.parseInt(value);
             if (port < 1 || port > 65535) {
