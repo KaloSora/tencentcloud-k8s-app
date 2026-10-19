@@ -3,6 +3,8 @@
 .idea
 .vscode
 build
+target/*
+!target/*.jar
 ci
 k8s
 charts

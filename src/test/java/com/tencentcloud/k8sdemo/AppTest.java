@@ -1,6 +1,7 @@
 package com.tencentcloud.k8sdemo;
 
 import com.sun.net.httpserver.HttpServer;
+import org.junit.jupiter.api.Test;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -9,12 +10,10 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.stream.Collectors;
 
-/** Simple test runner that needs no third-party test framework. */
+/** Verifies the sample application's HTTP endpoints through Maven Surefire. */
 public final class AppTest {
-    private AppTest() {
-    }
-
-    public static void main(String[] args) throws Exception {
+    @Test
+    void endpointsReturnExpectedResponses() throws Exception {
         HttpServer server = App.start(0);
         int port = server.getAddress().getPort();
         try {
