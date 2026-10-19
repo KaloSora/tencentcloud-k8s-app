@@ -23,6 +23,7 @@ spec:
       volumeMounts:
         - name: docker-config
           mountPath: /kaniko/.docker
+          readOnly: true
 
     - name: git
       image: alpine/git:latest
@@ -33,3 +34,6 @@ spec:
     - name: docker-config
       secret:
         secretName: harbor-docker-config
+        items:
+          - key: .dockerconfigjson
+            path: config.json
