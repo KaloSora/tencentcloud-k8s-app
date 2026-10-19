@@ -5,31 +5,98 @@ pipeline {
         }
     }
 
+    environment {
+        HARBOR_REGISTRY = 'harbor.core.com'
+        GITOPS_REPO = 'https://github.com/KaloSora/tencentcloud-k8s-gitops.git'
+    }
+
+    parameters {
+        string(name: 'HARBOR_PROJECT', defaultValue: 'library',
+               description: 'Existing Harbor project with push access for harbor-docker-config')
+    }
+
     options {
         disableConcurrentBuilds()
         timestamps()
         skipDefaultCheckout()
+        timeout(time: 30, unit: 'MINUTES')
     }
 
     stages {
         stage('Checkout') {
             steps {
-                checkout scm
+                script {
+                    def scmVars = checkout scm
+                    env.SOURCE_COMMIT = scmVars.GIT_COMMIT
+                    def project = params.HARBOR_PROJECT.trim()
+                    if (!(project ==~ /[a-z0-9]+([._-][a-z0-9]+)*/)) {
+                        error('HARBOR_PROJECT must be a lowercase Harbor project name')
+                    }
+                    env.HARBOR_PROJECT_NAME = project
+                }
             }
         }
 
-        stage('Validate') {
+        stage('Maven Package') {
             steps {
-                sh 'ci/jenkins/scripts/terraform-check.sh'
+                container('maven') {
+                    sh '''#!/bin/sh
+set -eu
+mvn -B -ntp -DskipTests clean package
+mkdir -p build
+mvn -B -ntp org.apache.maven.plugins:maven-help-plugin:3.5.1:evaluate \
+  -Dexpression=project.groupId -Doutput=build/maven-group-id.txt
+mvn -B -ntp org.apache.maven.plugins:maven-help-plugin:3.5.1:evaluate \
+  -Dexpression=project.artifactId -Doutput=build/maven-artifact-id.txt
+mvn -B -ntp org.apache.maven.plugins:maven-help-plugin:3.5.1:evaluate \
+  -Dexpression=project.version -Doutput=build/maven-version.txt
+'''
+                }
+                script {
+                    env.MAVEN_GROUP_ID = readFile('build/maven-group-id.txt').trim()
+                    env.MAVEN_ARTIFACT_ID = readFile('build/maven-artifact-id.txt').trim()
+                    env.MAVEN_VERSION = readFile('build/maven-version.txt').trim()
+                    if (!(env.MAVEN_GROUP_ID ==~ /[a-z0-9]+([._-][a-z0-9]+)*/)) {
+                        error('Maven groupId must be a lowercase container repository path component')
+                    }
+                    if (!(env.MAVEN_ARTIFACT_ID ==~ /[a-z0-9]+([._-][a-z0-9]+)*/)) {
+                        error('Maven artifactId must be a lowercase container image name')
+                    }
+                    if (!(env.MAVEN_VERSION ==~ /[A-Za-z0-9_][A-Za-z0-9_.-]*/)) {
+                        error('Maven version contains characters unsupported in container image tags')
+                    }
+                    def branch = (env.BRANCH_NAME ?: 'detached')
+                        .replaceAll(/[^A-Za-z0-9_.-]+/, '-').take(40)
+                    env.IMAGE_TAG = "${env.MAVEN_VERSION}-${branch}-${env.SOURCE_COMMIT.take(12)}-${env.BUILD_NUMBER}"
+                    if (env.IMAGE_TAG.length() > 128) {
+                        error('Generated image tag exceeds the 128-character limit')
+                    }
+                    env.IMAGE_REPOSITORY = "${env.HARBOR_REGISTRY}/${env.HARBOR_PROJECT_NAME}/${env.MAVEN_GROUP_ID}/${env.MAVEN_ARTIFACT_ID}"
+                    env.IMAGE_REF = "${env.IMAGE_REPOSITORY}:${env.IMAGE_TAG}"
+                    echo "Maven artifact: ${env.MAVEN_GROUP_ID}:${env.MAVEN_ARTIFACT_ID}:${env.MAVEN_VERSION}"
+                    echo "Image to publish: ${env.IMAGE_REF}"
+                }
             }
         }
 
-        stage('Plan') {
-            when {
-                changeRequest()
-            }
+        stage('Kaniko Build and Push') {
             steps {
-                sh 'ci/jenkins/scripts/terraform-plan.sh'
+                container(name: 'kaniko', shell: '/busybox/sh') {
+                    sh '''#!/busybox/sh
+set -eu
+test -s /kaniko/.docker/config.json
+mkdir -p build
+/kaniko/executor \
+  --context "dir://${WORKSPACE}" \
+  --dockerfile "${WORKSPACE}/Dockerfile" \
+  --destination "${IMAGE_REF}" \
+  --insecure-registry "${HARBOR_REGISTRY}" \
+  --digest-file "${WORKSPACE}/build/image-digest.txt"
+printf '%s\n' "${IMAGE_REF}" > build/image-ref.txt
+'''
+                }
+                archiveArtifacts artifacts: 'target/*.jar,build/maven-*.txt,build/image-digest.txt,build/image-ref.txt', fingerprint: true
+                echo "Published image: ${env.IMAGE_REF}"
             }
         }
     }
