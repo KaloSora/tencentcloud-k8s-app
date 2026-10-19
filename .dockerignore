@@ -1,0 +1,9 @@
+.git
+.gitignore
+.idea
+.vscode
+build
+ci
+k8s
+charts
+README.md
