@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: jenkins-agent
+  automountServiceAccountToken: false
+  containers:
+    - name: git
+      image: alpine/git:latest
+      command: ["sleep"]
+      args: ["99d"]
+    - name: python
+      image: python:3.13-slim
+      command: ["sleep"]
+      args: ["99d"]
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: "1"
+          memory: 512Mi
+      volumeMounts:
+        - name: registry-auth
+          mountPath: /registry-auth
+          readOnly: true
+  volumes:
+    - name: registry-auth
+      secret:
+        secretName: harbor-docker-config
+        items:
+          - key: .dockerconfigjson
+            path: config.json

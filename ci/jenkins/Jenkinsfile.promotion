@@ -1,0 +1,83 @@
+pipeline {
+    agent {
+        kubernetes {
+            yamlFile 'ci/jenkins/pod-templates/promotion-agent.yaml'
+            defaultContainer 'python'
+        }
+    }
+
+    environment {
+        GITOPS_REPO = 'KaloSora/tencentcloud-k8s-gitops'
+        GITOPS_BRANCH = 'main'
+        APP_REPO = 'KaloSora/tencentcloud-k8s-app'
+        GITOPS_CREDENTIALS_ID = 'gitops-github-token'
+    }
+
+    parameters {
+        choice(name: 'TARGET_ENV', choices: ['dev', 'uat', 'preprod', 'prod'],
+               description: 'Environment to promote to; creates a GitOps PR only')
+        string(name: 'IMAGE_REPOSITORY', defaultValue: 'harbor.core.com/library/com.tencentcloud/k8s-demo-app',
+               description: 'Repository from the successful build/image-ref.txt, without tag or digest')
+        string(name: 'IMAGE_DIGEST', defaultValue: '', description: 'Digest from build/image-digest.txt: sha256:...')
+        string(name: 'SOURCE_COMMIT', defaultValue: '', description: 'Full application commit SHA for the selected image')
+    }
+
+    options {
+        disableConcurrentBuilds()
+        timestamps()
+        skipDefaultCheckout()
+        timeout(time: 15, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    stages {
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    if (!(params.TARGET_ENV in ['dev', 'uat', 'preprod', 'prod'])) {
+                        error('Unsupported TARGET_ENV')
+                    }
+                    env.IMAGE_REPOSITORY = params.IMAGE_REPOSITORY.trim()
+                    env.IMAGE_DIGEST = params.IMAGE_DIGEST.trim()
+                    env.SOURCE_COMMIT = params.SOURCE_COMMIT.trim()
+                    if (!(env.IMAGE_REPOSITORY ==~ /harbor\.core\.com\/[a-z0-9]+([._-][a-z0-9]+)*(\/[a-z0-9]+([._-][a-z0-9]+)*)+/)) {
+                        error('IMAGE_REPOSITORY must be a harbor.core.com repository without tag or digest')
+                    }
+                    if (!(env.IMAGE_DIGEST ==~ /sha256:[a-f0-9]{64}/)) {
+                        error('IMAGE_DIGEST must be sha256 followed by 64 lowercase hexadecimal characters')
+                    }
+                    if (!(env.SOURCE_COMMIT ==~ /[a-f0-9]{40}/)) {
+                        error('SOURCE_COMMIT must be a full 40-character lowercase Git SHA')
+                    }
+                    currentBuild.description = "${params.TARGET_ENV}: ${env.IMAGE_DIGEST.take(19)}"
+                }
+            }
+        }
+        stage('Checkout Trusted Pipeline') {
+            steps {
+                container('git') {
+                    checkout scm
+                }
+            }
+        }
+        stage('Prepare Promotion') {
+            steps {
+                withCredentials([string(credentialsId: env.GITOPS_CREDENTIALS_ID, variable: 'GITHUB_TOKEN')]) {
+                    sh 'python3 ci/jenkins/promotion.py prepare'
+                }
+                archiveArtifacts artifacts: 'build/promotion-plan.json', fingerprint: true
+            }
+        }
+        stage('Create GitOps PR') {
+            steps {
+                withCredentials([string(credentialsId: env.GITOPS_CREDENTIALS_ID, variable: 'GITHUB_TOKEN')]) {
+                    sh 'python3 ci/jenkins/promotion.py publish'
+                }
+                archiveArtifacts artifacts: 'build/promotion-result.json', fingerprint: true
+                script {
+                    echo readFile('build/promotion-result.json')
+                }
+            }
+        }
+    }
+}
