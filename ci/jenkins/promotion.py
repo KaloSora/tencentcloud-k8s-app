@@ -56,20 +56,23 @@ def validate(env):
     target = env['TARGET_ENV']
     repository = env['IMAGE_REPOSITORY']
     digest = env['IMAGE_DIGEST']
-    source = env['SOURCE_COMMIT']
+    jira = env['JIRA']
+    version = env['VERSION']
     if target not in ENVIRONMENTS:
         raise ValueError('Unsupported TARGET_ENV')
     if not re.fullmatch(r'harbor\.core\.com/[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)+', repository):
         raise ValueError('Invalid Harbor IMAGE_REPOSITORY')
     if not re.fullmatch(r'sha256:[a-f0-9]{64}', digest):
         raise ValueError('Invalid IMAGE_DIGEST')
-    if not re.fullmatch(r'[a-f0-9]{40}', source):
-        raise ValueError('Invalid SOURCE_COMMIT')
-    return target, repository, digest, source
+    if not re.fullmatch(r'[A-Z][A-Z0-9]*-[0-9]+', jira):
+        raise ValueError('Invalid JIRA')
+    if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}', version):
+        raise ValueError('Invalid VERSION')
+    return target, repository, digest, jira, version
 
 
 def check_image(repository, digest, config_path='/registry-auth/config.json'):
-    """Verify the exact manifest bytes exist in the existing HTTP Harbor."""
+    """Verify manifest and config digests, then return the image config labels."""
     registry, image_path = repository.split('/', 1)
     auths = json.loads(Path(config_path).read_text())['auths']
     config = next((auths[key] for key in (registry, 'http://' + registry, 'https://' + registry)
@@ -99,11 +102,23 @@ def check_image(repository, digest, config_path='/registry-auth/config.json'):
             with urlopen(Request(token_url, headers={'Authorization': authorization}), timeout=30) as token_response:
                 token_body = json.load(token_response)
             token = token_body.get('token') or token_body['access_token']
-            response = urlopen(Request(url, headers={**headers, 'Authorization': 'Bearer ' + token}), timeout=30)
+            authorization = 'Bearer ' + token
+            response = urlopen(Request(url, headers={**headers, 'Authorization': authorization}), timeout=30)
         with response:
-            actual = 'sha256:' + hashlib.sha256(response.read()).hexdigest()
+            manifest_bytes = response.read()
+            actual = 'sha256:' + hashlib.sha256(manifest_bytes).hexdigest()
         if actual != digest:
             raise ValueError('Harbor manifest digest does not match IMAGE_DIGEST')
+        manifest = json.loads(manifest_bytes)
+        config_digest = manifest.get('config', {}).get('digest', '')
+        if not re.fullmatch(r'sha256:[a-f0-9]{64}', config_digest):
+            raise ValueError('Image must be a single-platform manifest with a sha256 config digest')
+        config_url = f'http://{registry}/v2/{image_path}/blobs/{config_digest}'
+        with urlopen(Request(config_url, headers={'Authorization': authorization}), timeout=30) as response:
+            config_bytes = response.read()
+        if 'sha256:' + hashlib.sha256(config_bytes).hexdigest() != config_digest:
+            raise ValueError('Harbor image config digest does not match its manifest')
+        return json.loads(config_bytes).get('config', {}).get('Labels') or {}
     except HTTPError as error:
         raise ValueError(f'Harbor manifest verification failed: HTTP {error.code}') from None
 
@@ -130,8 +145,17 @@ def deployment(api, repo, files, prefix, target):
     return path, document, matches[0]
 
 
-def prepare(api, env):
-    target, repository, digest, source = validate(env)
+def prepare(api, env, labels):
+    target, repository, digest, jira, version = validate(env)
+    if labels.get('org.opencontainers.image.version') != version:
+        raise ValueError('VERSION does not match the image application metadata; rebuild images missing application labels')
+    if jira not in labels.get('com.tencentcloud.image.jira', '').split(','):
+        raise ValueError('JIRA does not match the image application metadata; rebuild images missing application labels')
+    source = labels.get('org.opencontainers.image.revision', '')
+    if not re.fullmatch(r'[a-f0-9]{40}', source):
+        raise ValueError('Image application revision must be a full 40-character lowercase Git SHA')
+    if labels.get('org.opencontainers.image.source') != f'https://github.com/{env["APP_REPO"]}.git':
+        raise ValueError('Image source metadata must match APP_REPO HTTPS clone URL')
     repo = env['GITOPS_REPO']
     base_branch = env['GITOPS_BRANCH']
     base = api.request('GET', f'repos/{repo}/git/ref/heads/{quote(base_branch, safe="")}')['object']['sha']
@@ -142,9 +166,10 @@ def prepare(api, env):
     files = {item['path']: item for item in tree['tree'] if item['type'] == 'blob'}
     source_info = api.request('GET', f'repos/{env["APP_REPO"]}/commits/{source}')
     if source_info['sha'] != source:
-        raise ValueError('SOURCE_COMMIT could not be resolved exactly')
+        raise ValueError('Image application revision could not be resolved exactly')
     prefix = f'{ROOT}/{target}'
-    release = {'imageRepository': repository, 'imageDigest': digest, 'sourceCommit': source}
+    release = {'imageRepository': repository, 'imageDigest': digest, 'sourceCommit': source,
+               'jira': jira, 'version': version}
     image = repository + '@' + digest
     if target != 'dev':
         previous = ENVIRONMENTS[ENVIRONMENTS.index(target) - 1]
@@ -154,7 +179,7 @@ def prepare(api, env):
             raise ValueError(f'No release in {previous}; promote there first')
         prior = json.loads(api.blob(repo, marker['sha']))
         if any(prior.get(key) != value for key, value in release.items()):
-            raise ValueError(f'Selected image and SOURCE_COMMIT must match the release in {previous}')
+            raise ValueError(f'Selected image, Jira, version and application revision must match the release in {previous}')
         _, _, previous_container = deployment(api, repo, files, previous_prefix, previous)
         if previous_container.get('image') != image:
             raise ValueError(f'Deployment image in {previous} does not match its release metadata')
@@ -189,13 +214,15 @@ def publish(api, plan):
                        {'base_tree': plan['baseTree'], 'tree': plan['entries']})
     if tree['sha'] == plan['baseTree']:
         return {'status': 'unchanged', 'message': 'Target environment already declares this release'}
-    title = f'Promote k8s-demo-app to {plan["target"]}: {plan["release"]["imageDigest"][7:19]}'
+    title = (f'Promote k8s-demo-app to {plan["target"]}: {plan["release"]["jira"]} '
+             f'{plan["release"]["version"]} {plan["release"]["imageDigest"][7:19]}')
     commit = api.request('POST', f'repos/{repo}/git/commits',
                          {'message': title, 'tree': tree['sha'], 'parents': [plan['baseCommit']]})
     api.request('POST', f'repos/{repo}/git/refs',
                 {'ref': 'refs/heads/' + plan['branch'], 'sha': commit['sha']})
     release = plan['release']
     body = (f'Promote `{release["imageRepository"]}@{release["imageDigest"]}` to `{plan["target"]}`.\n\n'
+            f'Jira: `{release["jira"]}`; version: `{release["version"]}`\n\n'
             f'Application commit: `{release["sourceCommit"]}`\n\n'
             f'Jenkins build: {plan["buildUrl"]}\n\n'
             'Before merging, verify the prior environment is healthy, required tests and '
@@ -211,8 +238,8 @@ def main():
     api = GitHub(os.environ['GITHUB_TOKEN'])
     if sys.argv[1:] == ['prepare']:
         validate(os.environ)
-        check_image(os.environ['IMAGE_REPOSITORY'], os.environ['IMAGE_DIGEST'])
-        plan = prepare(api, os.environ)
+        labels = check_image(os.environ['IMAGE_REPOSITORY'], os.environ['IMAGE_DIGEST'])
+        plan = prepare(api, os.environ, labels)
         PLAN.parent.mkdir(parents=True, exist_ok=True)
         PLAN.write_text(json_text(plan))
         print(f'Prepared {plan["target"]}: {plan["release"]["imageRepository"]}@{plan["release"]["imageDigest"]}')
