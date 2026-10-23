@@ -50,12 +50,16 @@ class FakeGitHub:
 class PromotionTests(unittest.TestCase):
     def setUp(self):
         self.env = dict(TARGET_ENV='dev', IMAGE_REPOSITORY='harbor.core.com/library/com.tencentcloud/k8s-demo-app',
-                        IMAGE_DIGEST='sha256:' + 'b' * 64, SOURCE_COMMIT='a' * 40,
+                        IMAGE_DIGEST='sha256:' + 'b' * 64, JIRA='JIRA-1', VERSION='1.0.0-SNAPSHOT',
                         GITOPS_REPO='owner/gitops',
                         GITOPS_BRANCH='main', APP_REPO='owner/app', BUILD_URL='https://jenkins/build/1')
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
+        self.labels = {'org.opencontainers.image.version': self.env['VERSION'],
+                       'org.opencontainers.image.revision': 'a' * 40,
+                       'org.opencontainers.image.source': 'https://github.com/owner/app.git',
+                       'com.tencentcloud.image.jira': 'JIRA-1,JIRA-2'}
 
     def fixture(self):
         api = FakeGitHub()
@@ -73,26 +77,31 @@ class PromotionTests(unittest.TestCase):
         return api
 
     def prepare(self, api=None):
-        return p.prepare(api or self.fixture(), self.env)
+        return p.prepare(api or self.fixture(), self.env, self.labels)
 
     def prior(self, environment):
         api = self.fixture()
         api.files.append({'path': f'{p.ROOT}/{environment}/release.json', 'type': 'blob', 'sha': 'release'})
         api.prior = dict(imageRepository=self.env['IMAGE_REPOSITORY'], imageDigest=self.env['IMAGE_DIGEST'],
-                         sourceCommit=self.env['SOURCE_COMMIT'])
+                         sourceCommit='a' * 40, jira=self.env['JIRA'], version=self.env['VERSION'])
         api.blobs[environment]['spec']['template']['spec']['containers'][0]['image'] = (
             self.env['IMAGE_REPOSITORY'] + '@' + self.env['IMAGE_DIGEST'])
         return api
 
     def test_rejects_bad_parameters(self):
         for key, value in [('TARGET_ENV', '../../prod'), ('IMAGE_DIGEST', 'latest'),
-                           ('SOURCE_COMMIT', 'abc'), ('IMAGE_REPOSITORY', 'evil.example/app'),
+                           ('JIRA', 'jira-1'), ('JIRA', ''), ('JIRA', 'JIRA-1,JIRA-2'),
+                           ('VERSION', ''), ('VERSION', '1.0/evil'), ('VERSION', 'x' * 129),
+                           ('IMAGE_REPOSITORY', 'evil.example/app'),
                            ('IMAGE_REPOSITORY', 'harbor.core.com/library/app:latest')]:
             with self.subTest(key=key), self.assertRaises(ValueError):
                 p.validate({**self.env, key: value})
 
     def test_dev_changes_only_dev_and_its_application(self):
         plan = self.prepare()
+        self.assertEqual(plan['release']['jira'], 'JIRA-1')
+        self.assertEqual(plan['release']['version'], '1.0.0-SNAPSHOT')
+        self.assertEqual(plan['release']['sourceCommit'], 'a' * 40)
         for entry in plan['entries']:
             self.assertTrue(entry['path'].startswith(p.ROOT + '/dev/') or
                             entry['path'] == 'argocd/applications/k8s-demo-app-dev.yaml')
@@ -121,9 +130,9 @@ class PromotionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'promote there first'):
             self.prepare()
 
-    def test_rejects_different_digest_repository_or_source(self):
+    def test_rejects_different_release_coordinates(self):
         self.env['TARGET_ENV'] = 'uat'
-        for key in ('imageRepository', 'imageDigest', 'sourceCommit'):
+        for key in ('imageRepository', 'imageDigest', 'sourceCommit', 'jira', 'version'):
             with self.subTest(key=key):
                 api = self.prior('dev')
                 api.prior[key] = 'different'
@@ -179,6 +188,29 @@ class PromotionTests(unittest.TestCase):
         self.assertEqual(mutations[2][2]['ref'], 'refs/heads/' + plan['branch'])
         self.assertNotEqual(mutations[2][2]['ref'], 'refs/heads/main')
         self.assertEqual(mutations[-1][2]['base'], 'main')
+        self.assertIn('JIRA-1', mutations[-1][2]['title'])
+        self.assertIn('1.0.0-SNAPSHOT', mutations[-1][2]['body'])
+        self.assertIn('a' * 40, mutations[-1][2]['body'])
+
+    def test_rejects_missing_or_mismatched_image_metadata_without_github_calls(self):
+        for key, value in [('org.opencontainers.image.version', '2.0.0'),
+                           ('com.tencentcloud.image.jira', 'JIRA-10'),
+                           ('org.opencontainers.image.revision', 'abc'),
+                           ('org.opencontainers.image.source', 'https://github.com/other/app.git')]:
+            for labels in ({**self.labels, key: value}, {k: v for k, v in self.labels.items() if k != key}):
+                with self.subTest(key=key, labels=labels):
+                    api = self.fixture()
+                    with self.assertRaises(ValueError):
+                        p.prepare(api, self.env, labels)
+                    self.assertEqual(api.calls, [])
+
+    def test_old_prior_release_requires_repromotion(self):
+        self.env['TARGET_ENV'] = 'uat'
+        api = self.prior('dev')
+        del api.prior['jira']
+        del api.prior['version']
+        with self.assertRaisesRegex(ValueError, 'must match'):
+            self.prepare(api)
 
     def test_rejects_stale_base_without_writes(self):
         plan = self.prepare()
@@ -198,16 +230,28 @@ class PromotionTests(unittest.TestCase):
     def test_registry_digest_is_verified(self):
         config = self.directory / 'docker.json'
         config.write_text(json.dumps({'auths': {'harbor.core.com': {'auth': 'dXNlcjpwYXNz'}}}))
-        content = b'{"schemaVersion":2}'
+        config_bytes = json.dumps({'config': {'Labels': self.labels}}).encode()
+        config_digest = 'sha256:' + hashlib.sha256(config_bytes).hexdigest()
+        content = json.dumps({'schemaVersion': 2, 'config': {'digest': config_digest}}).encode()
         digest = 'sha256:' + hashlib.sha256(content).hexdigest()
         class Response:
+            def __init__(self, data): self.data = data
             def __enter__(self): return self
             def __exit__(self, *args): pass
-            def read(self): return content
-        with patch.object(p, 'urlopen', return_value=Response()):
-            p.check_image(self.env['IMAGE_REPOSITORY'], digest, str(config))
+            def read(self): return self.data
+        with patch.object(p, 'urlopen', side_effect=[Response(content), Response(config_bytes)]) as request:
+            self.assertEqual(p.check_image(self.env['IMAGE_REPOSITORY'], digest, str(config)), self.labels)
+            self.assertTrue(request.call_args_list[1].args[0].full_url.endswith('/blobs/' + config_digest))
+        with patch.object(p, 'urlopen', return_value=Response(content)):
             with self.assertRaisesRegex(ValueError, 'does not match'):
                 p.check_image(self.env['IMAGE_REPOSITORY'], self.env['IMAGE_DIGEST'], str(config))
+        with patch.object(p, 'urlopen', side_effect=[Response(content), Response(b'{}')]):
+            with self.assertRaisesRegex(ValueError, 'config digest does not match'):
+                p.check_image(self.env['IMAGE_REPOSITORY'], digest, str(config))
+        index = b'{"schemaVersion":2,"manifests":[]}'
+        with patch.object(p, 'urlopen', return_value=Response(index)):
+            with self.assertRaisesRegex(ValueError, 'single-platform'):
+                p.check_image(self.env['IMAGE_REPOSITORY'], 'sha256:' + hashlib.sha256(index).hexdigest(), str(config))
 
     def test_registry_rejects_credentials_to_foreign_token_endpoint(self):
         config = self.directory / 'docker.json'
@@ -222,7 +266,9 @@ class PromotionTests(unittest.TestCase):
     def test_registry_bearer_authentication(self):
         config = self.directory / 'docker.json'
         config.write_text(json.dumps({'auths': {'harbor.core.com': {'auth': 'dXNlcjpwYXNz'}}}))
-        content = b'{"schemaVersion":2}'
+        config_bytes = json.dumps({'config': {'Labels': self.labels}}).encode()
+        config_digest = 'sha256:' + hashlib.sha256(config_bytes).hexdigest()
+        content = json.dumps({'schemaVersion': 2, 'config': {'digest': config_digest}}).encode()
         digest = 'sha256:' + hashlib.sha256(content).hexdigest()
         class Response:
             def __init__(self, data): self.data = data
@@ -231,12 +277,13 @@ class PromotionTests(unittest.TestCase):
             def read(self): return self.data
         challenge = HTTPError('http://harbor.core.com', 401, 'Unauthorized',
                               {'WWW-Authenticate': 'Bearer realm="http://harbor.core.com/service/token",service="harbor-registry"'}, None)
-        with patch.object(p, 'urlopen', side_effect=[challenge, Response(b'{"token":"test-token"}'), Response(content)]) as request:
-            p.check_image(self.env['IMAGE_REPOSITORY'], digest, str(config))
-            self.assertEqual(request.call_count, 3)
+        with patch.object(p, 'urlopen', side_effect=[challenge, Response(b'{"token":"test-token"}'), Response(content), Response(config_bytes)]) as request:
+            self.assertEqual(p.check_image(self.env['IMAGE_REPOSITORY'], digest, str(config)), self.labels)
+            self.assertEqual(request.call_count, 4)
             self.assertIn('scope=repository%3Alibrary%2Fcom.tencentcloud%2Fk8s-demo-app%3Apull',
                           request.call_args_list[1].args[0].full_url)
             self.assertEqual(request.call_args_list[2].args[0].get_header('Authorization'), 'Bearer test-token')
+            self.assertEqual(request.call_args_list[3].args[0].get_header('Authorization'), 'Bearer test-token')
 
 
 if __name__ == '__main__':

@@ -19,7 +19,8 @@ pipeline {
         string(name: 'IMAGE_REPOSITORY', defaultValue: 'harbor.core.com/library/com.tencentcloud/k8s-demo-app',
                description: 'Repository from the successful build/image-ref.txt, without tag or digest')
         string(name: 'IMAGE_DIGEST', defaultValue: '', description: 'Digest from build/image-digest.txt: sha256:...')
-        string(name: 'SOURCE_COMMIT', defaultValue: '', description: 'Full application commit SHA for the selected image')
+        string(name: 'JIRA', defaultValue: '', description: 'Jira key recorded in the image, for example JIRA-1')
+        string(name: 'VERSION', defaultValue: '', description: 'Exact Maven version recorded in the image, for example 1.0.0-SNAPSHOT')
     }
 
     options {
@@ -39,17 +40,21 @@ pipeline {
                     }
                     env.IMAGE_REPOSITORY = params.IMAGE_REPOSITORY.trim()
                     env.IMAGE_DIGEST = params.IMAGE_DIGEST.trim()
-                    env.SOURCE_COMMIT = params.SOURCE_COMMIT.trim()
+                    env.JIRA = params.JIRA.trim()
+                    env.VERSION = params.VERSION.trim()
                     if (!(env.IMAGE_REPOSITORY ==~ /harbor\.core\.com\/[a-z0-9]+([._-][a-z0-9]+)*(\/[a-z0-9]+([._-][a-z0-9]+)*)+/)) {
                         error('IMAGE_REPOSITORY must be a harbor.core.com repository without tag or digest')
                     }
                     if (!(env.IMAGE_DIGEST ==~ /sha256:[a-f0-9]{64}/)) {
                         error('IMAGE_DIGEST must be sha256 followed by 64 lowercase hexadecimal characters')
                     }
-                    if (!(env.SOURCE_COMMIT ==~ /[a-f0-9]{40}/)) {
-                        error('SOURCE_COMMIT must be a full 40-character lowercase Git SHA')
+                    if (!(env.JIRA ==~ /[A-Z][A-Z0-9]*-[0-9]+/)) {
+                        error('JIRA must be an uppercase Jira key such as JIRA-1')
                     }
-                    currentBuild.description = "${params.TARGET_ENV}: ${env.IMAGE_DIGEST.take(19)}"
+                    if (!(env.VERSION ==~ /[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}/)) {
+                        error('VERSION must be an image-tag-compatible Maven version, at most 128 characters')
+                    }
+                    currentBuild.description = "${params.TARGET_ENV}: ${env.JIRA} ${env.VERSION} ${env.IMAGE_DIGEST.take(19)}"
                 }
             }
         }
