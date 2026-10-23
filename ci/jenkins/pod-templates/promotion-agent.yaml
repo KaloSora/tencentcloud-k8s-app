@@ -3,15 +3,49 @@ kind: Pod
 spec:
   serviceAccountName: jenkins-agent
   automountServiceAccountToken: false
+  securityContext:
+    # Use a numeric UID so runAsNonRoot also works with root/named image users.
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
   containers:
+    - name: jnlp
+      image: jenkins/inbound-agent:latest-jdk21@sha256:c93e68c1b1a9e5c4cb8e459dfd0f7fc63b6dc86b47f12883b8231c85d2e4ca4d
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
     - name: git
-      image: alpine/git:latest
+      image: alpine/git:latest@sha256:4fac439ee3b9204bec99c712b8a15942999632458f716ae8149fbb97cb760cd4
       command: ["sleep"]
       args: ["99d"]
+      env:
+        - name: HOME
+          value: /home/jenkins/agent
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
     - name: python
       image: python:3.13-slim
       command: ["sleep"]
       args: ["99d"]
+      env:
+        - name: HOME
+          value: /home/jenkins/agent
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
       resources:
         requests:
           cpu: 100m
