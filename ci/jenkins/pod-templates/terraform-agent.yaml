@@ -2,33 +2,75 @@ apiVersion: v1
 kind: Pod
 spec:
   serviceAccountName: jenkins-agent
+  automountServiceAccountToken: false
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
   containers:
     - name: jnlp
-      image: jenkins/inbound-agent:latest-jdk17
+      image: jenkins/inbound-agent:latest-jdk21@sha256:c93e68c1b1a9e5c4cb8e459dfd0f7fc63b6dc86b47f12883b8231c85d2e4ca4d
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
       resources:
         requests:
           cpu: 100m
           memory: 256Mi
 
     - name: maven
-      image: maven:3.9-eclipse-temurin-21
+      image: maven:3.9-eclipse-temurin-21@sha256:99e61abcff91a9b1333463bd8451fb18495d6eba9250ac66a338b518f8278320
       command: ["sleep"]
       args: ["99d"]
+      env:
+        - name: HOME
+          value: /home/jenkins/agent
+        - name: MAVEN_CONFIG
+          value: /home/jenkins/agent/.m2
+        - name: MAVEN_OPTS
+          value: -Duser.home=/home/jenkins/agent
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
 
     - name: kaniko
-      image: gcr.io/kaniko-project/executor:debug
+      image: gcr.io/kaniko-project/executor:debug@sha256:2562c4fe551399514277ffff7dcca9a3b1628c4ea38cb017d7286dc6ea52f4cd
       command: ["/busybox/sh", "-c"]
       args: ["cat"]
       tty: true
+      # This Dockerfile unpacks a root-owned base image and runs adduser/chown.
+      # Keep the exception local to the builder; never use privileged mode.
+      securityContext:
+        runAsUser: 0
+        runAsGroup: 0
+        runAsNonRoot: false
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+          add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID"]
       volumeMounts:
         - name: docker-config
           mountPath: /kaniko/.docker
           readOnly: true
 
     - name: git
-      image: alpine/git:latest
+      image: alpine/git:latest@sha256:4fac439ee3b9204bec99c712b8a15942999632458f716ae8149fbb97cb760cd4
       command: ["sleep"]
       args: ["99d"]
+      env:
+        - name: HOME
+          value: /home/jenkins/agent
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
 
   volumes:
     - name: docker-config

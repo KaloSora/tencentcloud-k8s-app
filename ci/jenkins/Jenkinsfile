@@ -1,6 +1,10 @@
 pipeline {
     agent {
         kubernetes {
+            namespace 'cicd-build'
+            // Bound agent startup independently of the build's execution timeout.
+            slaveConnectTimeout 180
+            activeDeadlineSeconds 3600
             yamlFile 'ci/jenkins/pod-templates/terraform-agent.yaml'
         }
     }
