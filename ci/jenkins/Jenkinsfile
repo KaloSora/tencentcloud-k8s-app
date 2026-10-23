@@ -32,6 +32,9 @@ pipeline {
                 script {
                     def scmVars = checkout scm
                     env.SOURCE_COMMIT = scmVars.GIT_COMMIT
+                    env.SOURCE_REPOSITORY = scmVars.GIT_URL
+                    env.SOURCE_BRANCH = env.BRANCH_NAME ?: 'detached'
+                    env.JIRA_KEYS = env.SOURCE_BRANCH.findAll(/[A-Z][A-Z0-9]*-[0-9]+/).unique().join(',')
                     def project = params.HARBOR_PROJECT.trim()
                     if (!(project ==~ /[a-z0-9]+([._-][a-z0-9]+)*/)) {
                         error('HARBOR_PROJECT must be a lowercase Harbor project name')
@@ -90,10 +93,20 @@ mvn -B -ntp org.apache.maven.plugins:maven-help-plugin:3.5.1:evaluate \
 set -eu
 test -s /kaniko/.docker/config.json
 mkdir -p build
+IMAGE_CREATED=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 /kaniko/executor \
   --context "dir://${WORKSPACE}" \
   --dockerfile "${WORKSPACE}/Dockerfile" \
   --destination "${IMAGE_REF}" \
+  --label "org.opencontainers.image.title=${MAVEN_ARTIFACT_ID}" \
+  --label "org.opencontainers.image.version=${MAVEN_VERSION}" \
+  --label "org.opencontainers.image.revision=${SOURCE_COMMIT}" \
+  --label "org.opencontainers.image.source=${SOURCE_REPOSITORY}" \
+  --label "org.opencontainers.image.url=${SOURCE_REPOSITORY}" \
+  --label "org.opencontainers.image.created=${IMAGE_CREATED}" \
+  --label "com.tencentcloud.image.branch=${SOURCE_BRANCH}" \
+  --label "com.tencentcloud.image.jira=${JIRA_KEYS}" \
+  --label "com.tencentcloud.image.build-number=${BUILD_NUMBER}" \
   --insecure-registry "${HARBOR_REGISTRY}" \
   --digest-file "${WORKSPACE}/build/image-digest.txt"
 printf '%s\n' "${IMAGE_REF}" > build/image-ref.txt
