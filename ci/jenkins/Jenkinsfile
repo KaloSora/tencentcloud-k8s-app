@@ -104,6 +104,14 @@ mvn -B -ntp org.apache.maven.plugins:maven-help-plugin:3.5.1:evaluate \
             }
         }
 
+        stage('Code Scan') {
+            steps {
+                // TODO: Integrate SonarQube deployed via Helm.
+                echo 'Code scan placeholder: SonarQube integration is planned.'
+                sleep time: 3, unit: 'SECONDS'
+            }
+        }
+
         stage('Kaniko Build and Push') {
             steps {
                 container(name: 'kaniko', shell: '/busybox/sh') {

@@ -48,7 +48,7 @@ UID `10001`.
 Configure a Multibranch Pipeline with script path `ci/jenkins/Jenkinsfile`.
 The pipeline checks out the branch selected by Jenkins (including `JIRA-1`),
 runs `mvn -B -ntp -DskipTests clean package` in the Maven container, reads
-`project.artifactId` and `project.version` through Maven Help Plugin, then uses
+`project.groupId`, `project.artifactId` and `project.version` through Maven Help Plugin, then uses
 Kaniko to package the resulting JAR and push the image. Maven resolves the
 effective project values, including inherited values and property expressions.
 Automated tests are temporarily skipped (`-DskipTests` still compiles test
@@ -58,9 +58,9 @@ update the GitOps repository.
 The registry is `harbor.core.com` over HTTP, without an explicit port. Set the
 `HARBOR_PROJECT` build parameter to an existing Harbor project; the default is
 `library`. The published image is
-`harbor.core.com/<project>/<artifactId>:<version>-<branch>-<12-char-SHA>-<build-number>`.
-For example: `harbor.core.com/library/k8s-demo-app:1.0.0-SNAPSHOT-jira-1-abcdef123456-7`.
-Branch names are lowercased, unsupported tag characters are replaced with `-`,
+`harbor.core.com/<project>/<groupId>/<artifactId>:<version>-<branch>-<12-char-SHA>-<build-number>`.
+For example: `harbor.core.com/library/com.tencentcloud.k8s.app/k8s-demo-app:1.0.0-SNAPSHOT-JIRA-1-abcdef123456-7`.
+Unsupported branch tag characters are replaced with `-`,
 and the branch portion is limited to 40 characters. The commit and build number
 distinguish builds across branches and rebuilds. Unsupported artifact IDs or
 versions fail before publishing rather than silently changing the Maven coordinates.
@@ -102,56 +102,67 @@ the build. Base images still come from the registries specified in the Dockerfil
 
 ## Deploy to Kubernetes
 
-### Using Helm
+Deployments are managed through Jenkins promotion and Argo CD. Environment
+Deployment and Service manifests are maintained in the
+[`tencentcloud-k8s-gitops`](https://github.com/KaloSora/tencentcloud-k8s-gitops)
+repository.
 
-The version-controlled chart is located in `charts/k8s-demo-app`. Requires Helm 3 or later and access to the target cluster.
+### Jenkins promotion parameters and Harbor 404 errors
 
-After building and pushing the image, validate the chart and deploy with the same image tag:
+Configure the promotion job with `ci/jenkins/Jenkinsfile.promotion`. From a
+single successful build, copy `build/image-ref.txt` into `IMAGE_REPOSITORY`
+and remove its final `:<tag>` suffix; copy `build/image-digest.txt` into
+`IMAGE_DIGEST`. Preserve the full repository path, including Maven groupId.
+The repository parameter defaults to `harbor.core.com/library/com.tencentcloud.k8s.app/`;
+append the image name, for example `k8s-demo-app`. Adjust the prefix if the
+successful build used different Maven coordinates or a different Harbor project.
+Use the same build's
+Maven version and a Jira key recorded in its image labels for `VERSION` and `JIRA`.
+
+For the current `pom.xml` and the default Harbor project, the repository is
+`harbor.core.com/library/com.tencentcloud.k8s.app/k8s-demo-app`. Use the
+successful build artifacts as the source of truth for any existing image.
+A manifest HTTP 404 means the requested repository/digest could not be fetched;
+check the paired artifacts and whether Harbor still retains the image.
+The diagnostic identifies manifest, token, or config blob requests separately.
+
+### Initialize environment configuration in GitOps
+
+Application-specific Deployment and Service files are maintained in
+`tencentcloud-k8s-gitops` under
+`apps/k8s-demo-app/environments/<environment>/manifests/` for `dev`, `uat`,
+`preprod` and `prod`. Each environment maps to the namespace of the same name.
+Review and merge these baseline files into the GitOps repository's `main`
+branch before running promotion. The application repository does not own
+initialization templates, and the promotion job has no initialization mode.
+
+Initial Argo CD Applications omit automatic sync because the baseline uses an
+`:unreleased` placeholder image. Do not manually sync them before the first
+promotion. Run promotion to `dev` using a real image from a successful build;
+merging that PR replaces the placeholder with its verified digest, writes
+`release.json`, and enables automatic sync for the target environment.
+Continue in order `dev → uat → preprod → prod`. Ensure Terraform has created
+the namespaces and provision Harbor pull credentials in each namespace.
+Promotion preserves existing Deployment settings and Service configuration.
+
+Run the Python regression tests with:
 
 ```sh
-IMAGE_REPOSITORY=registry.example.com/team/k8s-demo-app
-# Use the published tag from the Jenkins build/image-ref.txt artifact.
-IMAGE_TAG=1.0.0-SNAPSHOT-jira-1-abcdef123456-7
-
-helm lint ./charts/k8s-demo-app
-helm template k8s-demo-app ./charts/k8s-demo-app \
-  --set-string image.repository="${IMAGE_REPOSITORY}" \
-  --set-string image.tag="${IMAGE_TAG}"
-
-helm upgrade --install k8s-demo-app ./charts/k8s-demo-app \
-  --namespace demo --create-namespace \
-  --set-string image.repository="${IMAGE_REPOSITORY}" \
-  --set-string image.tag="${IMAGE_TAG}" \
-  --wait --timeout 3m
+python3 -m unittest discover -s test -p 'test_*.py'
 ```
 
-Replace the example tag with one that exists in your registry. The image must be accessible to cluster nodes. For private registries, create an image pull secret in the target namespace and reference it through `imagePullSecrets` in your values file.
+### Terraform-managed promotion credentials
 
-Configure replicas, ports, and resource limits in `values.yaml`, or supply environment-specific overrides using `-f values-dev.yaml`. CI should reuse the chart and override the image tag for each build. To publish the chart as a separate artifact, run `helm package ./charts/k8s-demo-app --destination build/charts` and increment `Chart.yaml`'s `version` whenever the chart changes.
+The infrastructure repository accepts `TF_VAR_gitops_credentials_id` (default
+`gitops-github-token`) and the required sensitive `TF_VAR_gitops_github_token`.
+The token must be nonempty and contain no whitespace. With Jenkins enabled,
+Terraform creates a Secret in the Jenkins controller namespace and
+JCasC creates a Jenkins **Secret text** credential. JCasC exposes its ID through
+`JENKINS_GITOPS_CREDENTIALS_ID`; `ci/jenkins/Jenkinsfile.promotion` uses that ID,
+falling back to `gitops-github-token` for manually configured installations.
+Keep this Jenkinsfile on the branch used by the promotion job up to date.
+The agent Pod template needs no token or credential ID configuration: the
+pipeline binds `GITHUB_TOKEN` only inside `withCredentials` blocks.
 
-To check the application after installation:
-
-```sh
-kubectl -n demo port-forward service/k8s-demo-app 18080:80
-# In another terminal:
-curl http://localhost:18080/healthz
-```
-
-Use a separate release name or namespace when testing alongside an existing deployment. Helm does not automatically adopt resources previously created with `kubectl apply`.
-
-### Using Plain Kubernetes Manifests
-
-After the pipeline builds and pushes the image, replace the image in the manifest with the actual registry address and an immutable tag:
-
-```sh
-sed "s|image: k8s-demo-app:latest|image: registry.example.com/team/k8s-demo-app:${GIT_COMMIT}|" \
-  k8s/deployment.yaml | kubectl apply -f -
-kubectl rollout status deployment/k8s-demo-app
-```
-
-Typical pipeline steps:
-
-1. Package with Maven, read the artifact ID and version, and build the container image.
-2. Push the image (the current Jenkins pipeline stops here).
-3. Replace the image in `k8s/deployment.yaml` and run `kubectl apply`.
-4. Run `kubectl rollout status deployment/k8s-demo-app`.
+The token remains in Terraform state/saved plans, so protect those files. Token
+rotation restarts the controller to refresh its Secret-backed environment.
