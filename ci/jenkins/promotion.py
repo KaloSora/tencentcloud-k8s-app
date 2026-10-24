@@ -85,6 +85,7 @@ def check_image(repository, digest, config_path='/registry-auth/config.json'):
                                    'application/vnd.oci.image.index.v1+json',
                                    'application/vnd.docker.distribution.manifest.v2+json',
                                    'application/vnd.docker.distribution.manifest.list.v2+json'))}
+    operation = 'manifest fetch'
     try:
         try:
             response = urlopen(Request(url, headers={**headers, 'Authorization': authorization}), timeout=30)
@@ -99,10 +100,12 @@ def check_image(repository, digest, config_path='/registry-auth/config.json'):
                 raise ValueError('Unexpected Harbor token endpoint')
             token_url = realm + '?' + urlencode({'service': fields.get('service', 'harbor-registry'),
                                                  'scope': f'repository:{image_path}:pull'})
+            operation = 'token fetch'
             with urlopen(Request(token_url, headers={'Authorization': authorization}), timeout=30) as token_response:
                 token_body = json.load(token_response)
             token = token_body.get('token') or token_body['access_token']
             authorization = 'Bearer ' + token
+            operation = 'manifest fetch'
             response = urlopen(Request(url, headers={**headers, 'Authorization': authorization}), timeout=30)
         with response:
             manifest_bytes = response.read()
@@ -114,13 +117,20 @@ def check_image(repository, digest, config_path='/registry-auth/config.json'):
         if not re.fullmatch(r'sha256:[a-f0-9]{64}', config_digest):
             raise ValueError('Image must be a single-platform manifest with a sha256 config digest')
         config_url = f'http://{registry}/v2/{image_path}/blobs/{config_digest}'
+        operation = 'config blob fetch'
         with urlopen(Request(config_url, headers={'Authorization': authorization}), timeout=30) as response:
             config_bytes = response.read()
         if 'sha256:' + hashlib.sha256(config_bytes).hexdigest() != config_digest:
             raise ValueError('Harbor image config digest does not match its manifest')
         return json.loads(config_bytes).get('config', {}).get('Labels') or {}
     except HTTPError as error:
-        raise ValueError(f'Harbor manifest verification failed: HTTP {error.code}') from None
+        message = f'Harbor {operation} failed for {repository}@{digest}: HTTP {error.code}'
+        if error.code == 404 and operation == 'manifest fetch':
+            message += ('. Verify IMAGE_REPOSITORY and IMAGE_DIGEST come from the same successful '
+                        'build/image-ref.txt and build/image-digest.txt; remove only the tag from '
+                        'image-ref.txt and preserve the full repository path, including Maven groupId. '
+                        'Also check that the artifact has not been deleted from Harbor.')
+        raise ValueError(message) from None
 
 
 def json_text(value):
