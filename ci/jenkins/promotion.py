@@ -14,7 +14,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 ENVIRONMENTS = ('dev', 'uat', 'preprod', 'prod')
-ROOT = 'apps/k8s-demo-app/environments'
+ROOT = 'apps'
 SOURCE_ROOT = 'deploy/environments'
 MANIFESTS = ('deployment.json', 'service.json')
 PLAN = Path('build/promotion-plan.json')
@@ -152,10 +152,31 @@ def manifest(api, repo, files, path):
     return document
 
 
-def validate_deployment(document, path, target):
+def artifact_id(labels, repository):
+    # The build pipeline writes Maven's effective artifactId to this image label.
+    value = labels.get('org.opencontainers.image.title', '')
+    if not isinstance(value, str) or not re.fullmatch(r'[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?', value):
+        raise ValueError('Image artifactId (org.opencontainers.image.title) must be a Kubernetes Service name: 1-63 lowercase letters, digits or hyphens, starting with a letter and ending with a letter or digit')
+    if repository.rsplit('/', 1)[-1] != value:
+        raise ValueError('Image artifactId must match the final IMAGE_REPOSITORY component')
+    return value
+
+
+def render_artifact(value, artifact):
+    """Substitute an explicit token in JSON values without executing templates."""
+    if isinstance(value, str):
+        return value.replace('${ARTIFACT_ID}', artifact)
+    if isinstance(value, list):
+        return [render_artifact(item, artifact) for item in value]
+    if isinstance(value, dict):
+        return {key: render_artifact(item, artifact) for key, item in value.items()}
+    return value
+
+
+def validate_deployment(document, path, target, artifact):
     if (document.get('apiVersion') != 'apps/v1' or document.get('kind') != 'Deployment'
-            or document.get('metadata', {}).get('name') != 'k8s-demo-app'):
-        raise ValueError(f'{path} must define the k8s-demo-app Deployment')
+            or document.get('metadata', {}).get('name') != artifact):
+        raise ValueError(f'{path} must define the {artifact} Deployment; use ${{ARTIFACT_ID}} for its name')
     if document['metadata'].get('namespace', target) != target:
         raise ValueError(f'{path} namespace must match {target}')
     template = document['spec'].get('template', {})
@@ -170,7 +191,7 @@ def validate_deployment(document, path, target):
     return matches[0]
 
 
-def source_manifests(api, repo, tree_sha, image):
+def source_manifests(api, repo, tree_sha, image, artifact):
     tree = api.request('GET', f'repos/{repo}/git/trees/{tree_sha}?recursive=1')
     if tree.get('truncated'):
         raise ValueError('Application tree is truncated; refusing incomplete promotion')
@@ -186,13 +207,13 @@ def source_manifests(api, repo, tree_sha, image):
         documents = {}
         for name in MANIFESTS:
             path = prefix + name
-            document = manifest(api, repo, files, path)
+            document = render_artifact(manifest(api, repo, files, path), artifact)
             if name == 'deployment.json':
-                validate_deployment(document, path, target)['image'] = image
+                validate_deployment(document, path, target, artifact)['image'] = image
             else:
                 if (document.get('apiVersion') != 'v1' or document.get('kind') != 'Service'
-                        or document.get('metadata', {}).get('name') != 'k8s-demo-app'):
-                    raise ValueError(f'{path} must define the k8s-demo-app Service')
+                        or document.get('metadata', {}).get('name') != artifact):
+                    raise ValueError(f'{path} must define the {artifact} Service; use ${{ARTIFACT_ID}} for its name')
                 if document['metadata'].get('namespace', target) != target:
                     raise ValueError(f'{path} namespace must match {target}')
                 if document.get('spec', {}).get('type', 'ClusterIP') != 'ClusterIP':
@@ -217,6 +238,8 @@ def prepare(api, env, labels):
         raise ValueError('Image application revision must be a full 40-character lowercase Git SHA')
     if labels.get('org.opencontainers.image.source') != f'https://github.com/{env["APP_REPO"]}.git':
         raise ValueError('Image source metadata must match APP_REPO HTTPS clone URL')
+    artifact = artifact_id(labels, repository)
+    root = f'{ROOT}/{artifact}/environments'
     repo = env['GITOPS_REPO']
     base_branch = env['GITOPS_BRANCH']
     base = api.request('GET', f'repos/{repo}/git/ref/heads/{quote(base_branch, safe="")}')['object']['sha']
@@ -229,13 +252,13 @@ def prepare(api, env, labels):
     if source_info['sha'] != source:
         raise ValueError('Image application revision could not be resolved exactly')
     image = repository + '@' + digest
-    bundle, config_digest = source_manifests(api, env['APP_REPO'], source_info['commit']['tree']['sha'], image)
-    prefix = f'{ROOT}/{target}'
+    bundle, config_digest = source_manifests(api, env['APP_REPO'], source_info['commit']['tree']['sha'], image, artifact)
+    prefix = f'{root}/{target}'
     release = {'imageRepository': repository, 'imageDigest': digest, 'sourceCommit': source,
-               'jira': jira, 'version': version, 'configDigest': config_digest}
+               'jira': jira, 'version': version, 'configDigest': config_digest, 'artifactId': artifact}
     if target != 'dev':
         previous = ENVIRONMENTS[ENVIRONMENTS.index(target) - 1]
-        previous_prefix = f'{ROOT}/{previous}'
+        previous_prefix = f'{root}/{previous}'
         marker = files.get(f'{previous_prefix}/release.json')
         if not marker:
             raise ValueError(f'No release in {previous}; promote there first')
@@ -249,7 +272,7 @@ def prepare(api, env, labels):
 
     application = {
         'apiVersion': 'argoproj.io/v1alpha1', 'kind': 'Application',
-        'metadata': {'name': 'k8s-demo-app-' + target, 'namespace': 'argocd'},
+        'metadata': {'name': artifact + '-' + target, 'namespace': 'argocd'},
         'spec': {'project': 'business-apps',
                  'source': {'repoURL': f'https://github.com/{repo}.git', 'targetRevision': base_branch,
                             'path': prefix + '/manifests', 'directory': {'recurse': False}},
@@ -258,12 +281,12 @@ def prepare(api, env, labels):
     entries = []
     outputs = [(f'{prefix}/manifests/{name}', value) for name, value in bundle[target].items()]
     outputs.extend(((f'{prefix}/release.json', release),
-                    (f'argocd/applications/k8s-demo-app-{target}.yaml', application)))
+                    (f'argocd/applications/{artifact}-{target}.yaml', application)))
     for output_path, value in outputs:
         entries.append({'path': output_path, 'mode': '100644', 'type': 'blob', 'content': json_text(value)})
     return {'repository': repo, 'baseBranch': base_branch, 'baseCommit': base,
             'baseTree': commit['tree']['sha'], 'target': target, 'release': release,
-            'branch': f'promotion/{target}-{digest[7:19]}-{uuid.uuid4().hex[:12]}',
+            'branch': f'promotion/{artifact}/{target}-{digest[7:19]}-{uuid.uuid4().hex[:12]}',
             'buildUrl': env.get('BUILD_URL', ''), 'entries': entries}
 
 
@@ -276,7 +299,7 @@ def publish(api, plan):
                        {'base_tree': plan['baseTree'], 'tree': plan['entries']})
     if tree['sha'] == plan['baseTree']:
         return {'status': 'unchanged', 'message': 'Target environment already declares this release'}
-    title = (f'Promote k8s-demo-app to {plan["target"]}: {plan["release"]["jira"]} '
+    title = (f'Promote {plan["release"]["artifactId"]} to {plan["target"]}: {plan["release"]["jira"]} '
              f'{plan["release"]["version"]} {plan["release"]["imageDigest"][7:19]}')
     commit = api.request('POST', f'repos/{repo}/git/commits',
                          {'message': title, 'tree': tree['sha'], 'parents': [plan['baseCommit']]})
