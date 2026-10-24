@@ -34,7 +34,25 @@ pipeline {
                     env.SOURCE_COMMIT = scmVars.GIT_COMMIT
                     env.SOURCE_REPOSITORY = scmVars.GIT_URL
                     env.SOURCE_BRANCH = env.BRANCH_NAME ?: 'detached'
-                    env.JIRA_KEYS = env.SOURCE_BRANCH.findAll(/[A-Z][A-Z0-9]*-[0-9]+/).unique().join(',')
+                    // Extract metadata on the agent without Groovy regex APIs requiring script approval.
+                    container('maven') {
+                        env.JIRA_KEYS = sh(returnStdout: true, script: '''#!/bin/sh
+set -eu
+export LC_ALL=C
+printf '%s' "$SOURCE_BRANCH" | awk '
+{
+    remaining = $0
+    while (match(remaining, /[A-Z][A-Z0-9]*-[0-9]+/)) {
+        key = substr(remaining, RSTART, RLENGTH)
+        if (!seen[key]++) {
+            printf "%s%s", separator, key
+            separator = ","
+        }
+        remaining = substr(remaining, RSTART + RLENGTH)
+    }
+}'
+''').trim()
+                    }
                     def project = params.HARBOR_PROJECT.trim()
                     if (!(project ==~ /[a-z0-9]+([._-][a-z0-9]+)*/)) {
                         error('HARBOR_PROJECT must be a lowercase Harbor project name')
