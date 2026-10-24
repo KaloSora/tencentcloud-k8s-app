@@ -15,6 +15,8 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 ENVIRONMENTS = ('dev', 'uat', 'preprod', 'prod')
 ROOT = 'apps/k8s-demo-app/environments'
+SOURCE_ROOT = 'deploy/environments'
+MANIFESTS = ('deployment.json', 'service.json')
 PLAN = Path('build/promotion-plan.json')
 RESULT = Path('build/promotion-result.json')
 
@@ -137,22 +139,71 @@ def json_text(value):
     return json.dumps(value, indent=2, sort_keys=True) + '\n'
 
 
-def deployment(api, repo, files, prefix, target):
-    path = prefix + '/manifests/deployment.json'
+def manifest(api, repo, files, path):
     item = files.get(path)
     if not item:
-        raise ValueError(f'Missing {path}; merge the GitOps environment manifests first')
+        raise ValueError(f'Missing {path} in {repo}; commit deployment configuration before building the image')
+    if item.get('mode', '100644') != '100644':
+        raise ValueError(f'{path} must be a regular non-executable file')
     document = json.loads(api.blob(repo, item['sha']))
+    if (not isinstance(document, dict) or not isinstance(document.get('metadata'), dict)
+            or not isinstance(document.get('spec'), dict)):
+        raise ValueError(f'{path} must be a JSON object with metadata and spec objects')
+    return document
+
+
+def validate_deployment(document, path, target):
     if (document.get('apiVersion') != 'apps/v1' or document.get('kind') != 'Deployment'
             or document.get('metadata', {}).get('name') != 'k8s-demo-app'):
         raise ValueError(f'{path} must define the k8s-demo-app Deployment')
     if document['metadata'].get('namespace', target) != target:
         raise ValueError(f'{path} namespace must match {target}')
-    containers = document.get('spec', {}).get('template', {}).get('spec', {}).get('containers', [])
+    template = document['spec'].get('template', {})
+    if not isinstance(template, dict) or not isinstance(template.get('spec'), dict):
+        raise ValueError(f'{path} must contain a Pod template spec')
+    containers = template['spec'].get('containers', [])
+    if not isinstance(containers, list) or any(not isinstance(c, dict) for c in containers):
+        raise ValueError(f'{path} containers must be an array of objects')
     matches = [container for container in containers if container.get('name') == 'app']
     if len(matches) != 1:
         raise ValueError(f'{path} must contain exactly one app container')
-    return path, document, matches[0]
+    return matches[0]
+
+
+def source_manifests(api, repo, tree_sha, image):
+    tree = api.request('GET', f'repos/{repo}/git/trees/{tree_sha}?recursive=1')
+    if tree.get('truncated'):
+        raise ValueError('Application tree is truncated; refusing incomplete promotion')
+    files = {item['path']: item for item in tree['tree'] if item['type'] == 'blob'}
+    bundle = {}
+    for target in ENVIRONMENTS:
+        prefix = f'{SOURCE_ROOT}/{target}/manifests/'
+        expected = {prefix + name for name in MANIFESTS}
+        unexpected = {item['path'] for item in tree['tree']
+                      if item['path'].startswith(prefix) and item['path'] not in expected}
+        if unexpected:
+            raise ValueError(f'Unsupported deployment configuration: {sorted(unexpected)}; only Deployment and Service JSON files are supported')
+        documents = {}
+        for name in MANIFESTS:
+            path = prefix + name
+            document = manifest(api, repo, files, path)
+            if name == 'deployment.json':
+                validate_deployment(document, path, target)['image'] = image
+            else:
+                if (document.get('apiVersion') != 'v1' or document.get('kind') != 'Service'
+                        or document.get('metadata', {}).get('name') != 'k8s-demo-app'):
+                    raise ValueError(f'{path} must define the k8s-demo-app Service')
+                if document['metadata'].get('namespace', target) != target:
+                    raise ValueError(f'{path} namespace must match {target}')
+                if document.get('spec', {}).get('type', 'ClusterIP') != 'ClusterIP':
+                    raise ValueError(f'{path} must use an internal ClusterIP Service')
+            document['metadata']['namespace'] = target
+            documents[name] = document
+        bundle[target] = documents
+    # One identity covers all environment configurations of the release, so
+    # environment-specific replica/resource differences still promote together.
+    digest = 'sha256:' + hashlib.sha256(json_text(bundle).encode()).hexdigest()
+    return bundle, digest
 
 
 def prepare(api, env, labels):
@@ -177,10 +228,11 @@ def prepare(api, env, labels):
     source_info = api.request('GET', f'repos/{env["APP_REPO"]}/commits/{source}')
     if source_info['sha'] != source:
         raise ValueError('Image application revision could not be resolved exactly')
+    image = repository + '@' + digest
+    bundle, config_digest = source_manifests(api, env['APP_REPO'], source_info['commit']['tree']['sha'], image)
     prefix = f'{ROOT}/{target}'
     release = {'imageRepository': repository, 'imageDigest': digest, 'sourceCommit': source,
-               'jira': jira, 'version': version}
-    image = repository + '@' + digest
+               'jira': jira, 'version': version, 'configDigest': config_digest}
     if target != 'dev':
         previous = ENVIRONMENTS[ENVIRONMENTS.index(target) - 1]
         previous_prefix = f'{ROOT}/{previous}'
@@ -189,14 +241,12 @@ def prepare(api, env, labels):
             raise ValueError(f'No release in {previous}; promote there first')
         prior = json.loads(api.blob(repo, marker['sha']))
         if any(prior.get(key) != value for key, value in release.items()):
-            raise ValueError(f'Selected image, Jira, version and application revision must match the release in {previous}')
-        _, _, previous_container = deployment(api, repo, files, previous_prefix, previous)
-        if previous_container.get('image') != image:
-            raise ValueError(f'Deployment image in {previous} does not match its release metadata')
+            raise ValueError(f'Selected image, Jira, version, application revision and configuration must match the release in {previous}; re-promote there first if it uses the old release format')
+        for name, expected in bundle[previous].items():
+            path = f'{previous_prefix}/manifests/{name}'
+            if manifest(api, repo, files, path) != expected:
+                raise ValueError(f'{path} does not match its release metadata and source configuration')
 
-    path, document, container = deployment(api, repo, files, prefix, target)
-    # Preserve every destination setting, including sidecar images and pull secrets.
-    container['image'] = image
     application = {
         'apiVersion': 'argoproj.io/v1alpha1', 'kind': 'Application',
         'metadata': {'name': 'k8s-demo-app-' + target, 'namespace': 'argocd'},
@@ -206,8 +256,10 @@ def prepare(api, env, labels):
                  'destination': {'server': 'https://kubernetes.default.svc', 'namespace': target},
                  'syncPolicy': {'automated': {'prune': False, 'selfHeal': True}}}}
     entries = []
-    for output_path, value in ((path, document), (f'{prefix}/release.json', release),
-                               (f'argocd/applications/k8s-demo-app-{target}.yaml', application)):
+    outputs = [(f'{prefix}/manifests/{name}', value) for name, value in bundle[target].items()]
+    outputs.extend(((f'{prefix}/release.json', release),
+                    (f'argocd/applications/k8s-demo-app-{target}.yaml', application)))
+    for output_path, value in outputs:
         entries.append({'path': output_path, 'mode': '100644', 'type': 'blob', 'content': json_text(value)})
     return {'repository': repo, 'baseBranch': base_branch, 'baseCommit': base,
             'baseTree': commit['tree']['sha'], 'target': target, 'release': release,
@@ -234,6 +286,8 @@ def publish(api, plan):
     body = (f'Promote `{release["imageRepository"]}@{release["imageDigest"]}` to `{plan["target"]}`.\n\n'
             f'Jira: `{release["jira"]}`; version: `{release["version"]}`\n\n'
             f'Application commit: `{release["sourceCommit"]}`\n\n'
+            f'Configuration bundle: `{release["configDigest"]}` (all environments, from the application commit).\n\n'
+            'Deployment and Service are generated from app-owned configuration; review their changes together with the image.\n\n'
             f'Jenkins build: {plan["buildUrl"]}\n\n'
             'Before merging, verify the prior environment is healthy, required tests and '
             'acceptance have passed, and this candidate has not been superseded. '
