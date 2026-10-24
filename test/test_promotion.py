@@ -19,6 +19,7 @@ class FakeGitHub:
     def __init__(self, files=None, prior=None):
         self.files = files or []
         self.prior = prior
+        self.source_files = []
         self.blobs = {}
         self.calls = []
         self.base = 'base'
@@ -31,9 +32,9 @@ class FakeGitHub:
         if method == 'GET' and '/git/commits/' in path:
             return {'tree': {'sha': 'tree'}}
         if method == 'GET' and '/git/trees/' in path:
-            return {'tree': self.files, 'truncated': False}
+            return {'tree': self.source_files if path.startswith('repos/owner/app/') else self.files, 'truncated': False}
         if '/commits/' in path and method == 'GET':
-            return {'sha': 'a' * 40}
+            return {'sha': 'a' * 40, 'commit': {'tree': {'sha': 'source-tree'}}}
         if method == 'POST' and path.endswith('/git/trees'):
             return {'sha': 'tree' if self.unchanged else 'new-tree'}
         if method == 'POST' and path.endswith('/git/commits'):
@@ -57,7 +58,9 @@ class PromotionTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
-        self.labels = {'org.opencontainers.image.version': self.env['VERSION'],
+        self.root = 'apps/k8s-demo-app/environments'
+        self.labels = {'org.opencontainers.image.title': 'k8s-demo-app',
+                       'org.opencontainers.image.version': self.env['VERSION'],
                        'org.opencontainers.image.revision': 'a' * 40,
                        'org.opencontainers.image.source': 'https://github.com/owner/app.git',
                        'com.tencentcloud.image.jira': 'JIRA-1,JIRA-2'}
@@ -65,7 +68,7 @@ class PromotionTests(unittest.TestCase):
     def fixture(self):
         api = FakeGitHub()
         for target in p.ENVIRONMENTS:
-            path = f'{p.ROOT}/{target}/manifests/deployment.json'
+            path = f'{self.root}/{target}/manifests/deployment.json'
             api.files.append({'path': path, 'type': 'blob', 'sha': target})
             api.blobs[target] = {
                 'apiVersion': 'apps/v1', 'kind': 'Deployment',
@@ -75,6 +78,18 @@ class PromotionTests(unittest.TestCase):
                     'containers': [{'name': 'app', 'image': 'old-image',
                                     'resources': {'requests': {'cpu': '100m'}}},
                                    {'name': 'sidecar', 'image': 'sidecar:v1'}]}}}}
+            api.blobs['source-' + target] = copy.deepcopy(api.blobs[target])
+            api.blobs['source-' + target]['metadata']['name'] = '${ARTIFACT_ID}'
+            api.blobs['source-' + target]['spec']['selector'] = {'matchLabels': {'app': '${ARTIFACT_ID}'}}
+            api.blobs['source-' + target]['spec']['template']['metadata'] = {'labels': {'app': '${ARTIFACT_ID}'}}
+            api.blobs['service-' + target] = {
+                'apiVersion': 'v1', 'kind': 'Service',
+                'metadata': {'name': '${ARTIFACT_ID}', 'namespace': target},
+                'spec': {'type': 'ClusterIP', 'selector': {'app': '${ARTIFACT_ID}'},
+                         'ports': [{'port': 80, 'targetPort': 18080}]}}
+            for name, sha in [('deployment.json', 'source-' + target), ('service.json', 'service-' + target)]:
+                api.source_files.append({'path': f'{p.SOURCE_ROOT}/{target}/manifests/{name}',
+                                         'type': 'blob', 'sha': sha, 'mode': '100644'})
         return api
 
     def prepare(self, api=None):
@@ -82,11 +97,16 @@ class PromotionTests(unittest.TestCase):
 
     def prior(self, environment):
         api = self.fixture()
-        api.files.append({'path': f'{p.ROOT}/{environment}/release.json', 'type': 'blob', 'sha': 'release'})
+        api.files.append({'path': f'{self.root}/{environment}/release.json', 'type': 'blob', 'sha': 'release'})
+        bundle, config_digest = p.source_manifests(api, self.env['APP_REPO'], 'source-tree',
+            self.env['IMAGE_REPOSITORY'] + '@' + self.env['IMAGE_DIGEST'], self.labels['org.opencontainers.image.title'])
         api.prior = dict(imageRepository=self.env['IMAGE_REPOSITORY'], imageDigest=self.env['IMAGE_DIGEST'],
-                         sourceCommit='a' * 40, jira=self.env['JIRA'], version=self.env['VERSION'])
-        api.blobs[environment]['spec']['template']['spec']['containers'][0]['image'] = (
-            self.env['IMAGE_REPOSITORY'] + '@' + self.env['IMAGE_DIGEST'])
+                         sourceCommit='a' * 40, jira=self.env['JIRA'], version=self.env['VERSION'],
+                         configDigest=config_digest, artifactId=self.labels['org.opencontainers.image.title'])
+        api.blobs[environment] = bundle[environment]['deployment.json']
+        api.blobs['prior-service'] = bundle[environment]['service.json']
+        api.files.append({'path': f'{self.root}/{environment}/manifests/service.json',
+                          'type': 'blob', 'sha': 'prior-service'})
         return api
 
     def test_rejects_bad_parameters(self):
@@ -104,7 +124,7 @@ class PromotionTests(unittest.TestCase):
         self.assertEqual(plan['release']['version'], '1.0.0-SNAPSHOT')
         self.assertEqual(plan['release']['sourceCommit'], 'a' * 40)
         for entry in plan['entries']:
-            self.assertTrue(entry['path'].startswith(p.ROOT + '/dev/') or
+            self.assertTrue(entry['path'].startswith(self.root + '/dev/') or
                             entry['path'] == 'argocd/applications/k8s-demo-app-dev.yaml')
         document = next(json.loads(e['content']) for e in plan['entries'] if e['path'].endswith('/deployment.json'))
         self.assertEqual(document['spec']['template']['spec']['containers'][0]['image'],
@@ -133,27 +153,28 @@ class PromotionTests(unittest.TestCase):
 
     def test_rejects_different_release_coordinates(self):
         self.env['TARGET_ENV'] = 'uat'
-        for key in ('imageRepository', 'imageDigest', 'sourceCommit', 'jira', 'version'):
+        for key in ('imageRepository', 'imageDigest', 'sourceCommit', 'jira', 'version', 'configDigest', 'artifactId'):
             with self.subTest(key=key):
                 api = self.prior('dev')
                 api.prior[key] = 'different'
                 with self.assertRaisesRegex(ValueError, 'must match'):
                     self.prepare(api)
 
-    def test_only_changes_app_image_preserving_all_environment_settings(self):
+    def test_copies_source_settings_over_destination_settings(self):
         api = self.fixture()
-        expected = copy.deepcopy(api.blobs['dev'])
+        api.blobs['dev']['spec']['replicas'] = 99
+        expected = p.render_artifact(copy.deepcopy(api.blobs['source-dev']), 'k8s-demo-app')
         expected['spec']['template']['spec']['containers'][0]['image'] = (
             self.env['IMAGE_REPOSITORY'] + '@' + self.env['IMAGE_DIGEST'])
         plan = self.prepare(api)
         document = next(json.loads(e['content']) for e in plan['entries'] if e['path'].endswith('/deployment.json'))
         self.assertEqual(document, expected)
-        self.assertEqual(len(plan['entries']), 3)
-        self.assertFalse(any('/service.json' in e['path'] for e in plan['entries']))
+        self.assertEqual(len(plan['entries']), 4)
+        self.assertTrue(any('/service.json' in e['path'] for e in plan['entries']))
 
-    def test_missing_target_manifest_fails_without_writes(self):
+    def test_missing_source_manifest_fails_without_writes(self):
         api = FakeGitHub()
-        with self.assertRaisesRegex(ValueError, 'merge the GitOps environment manifests first'):
+        with self.assertRaisesRegex(ValueError, 'commit deployment configuration before building'):
             self.prepare(api)
         self.assertTrue(all(method == 'GET' for method, _, _ in api.calls))
 
@@ -161,7 +182,7 @@ class PromotionTests(unittest.TestCase):
         for mutation in ('namespace', 'missing', 'duplicate'):
             with self.subTest(mutation=mutation):
                 api = self.fixture()
-                document = api.blobs['dev']
+                document = api.blobs['source-dev']
                 if mutation == 'namespace':
                     document['metadata']['namespace'] = 'prod'
                 elif mutation == 'missing':
@@ -194,7 +215,8 @@ class PromotionTests(unittest.TestCase):
         self.assertIn('a' * 40, mutations[-1][2]['body'])
 
     def test_rejects_missing_or_mismatched_image_metadata_without_github_calls(self):
-        for key, value in [('org.opencontainers.image.version', '2.0.0'),
+        for key, value in [('org.opencontainers.image.title', 'other-app'),
+                           ('org.opencontainers.image.version', '2.0.0'),
                            ('com.tencentcloud.image.jira', 'JIRA-10'),
                            ('org.opencontainers.image.revision', 'abc'),
                            ('org.opencontainers.image.source', 'https://github.com/other/app.git')]:
@@ -227,6 +249,128 @@ class PromotionTests(unittest.TestCase):
         api.unchanged = True
         self.assertEqual(p.publish(api, plan)['status'], 'unchanged')
         self.assertFalse(any(path.endswith(('/git/refs', '/pulls')) for _, path, _ in api.calls))
+
+    def select_artifact(self, name):
+        self.labels['org.opencontainers.image.title'] = name
+        self.env['IMAGE_REPOSITORY'] = 'harbor.core.com/library/com.tencentcloud/' + name
+        self.root = f'apps/{name}/environments'
+
+    def test_new_artifact_generates_isolated_paths_names_selectors_and_pr(self):
+        self.select_artifact('order-service')
+        api = self.fixture()
+        plan = self.prepare(api)
+        self.assertEqual(plan['release']['artifactId'], 'order-service')
+        self.assertTrue(plan['branch'].startswith('promotion/order-service/'))
+        self.assertEqual({e['path'] for e in plan['entries']}, {
+            'apps/order-service/environments/dev/manifests/deployment.json',
+            'apps/order-service/environments/dev/manifests/service.json',
+            'apps/order-service/environments/dev/release.json',
+            'argocd/applications/order-service-dev.yaml'})
+        for entry in plan['entries']:
+            document = json.loads(entry['content'])
+            if entry['path'].startswith('argocd/'):
+                self.assertEqual(document['metadata']['name'], 'order-service-dev')
+                self.assertEqual(document['spec']['source']['path'], self.root + '/dev/manifests')
+            elif '/manifests/' in entry['path']:
+                self.assertEqual(document['metadata']['name'], 'order-service')
+                if document['kind'] == 'Deployment':
+                    self.assertEqual(document['spec']['selector']['matchLabels'], {'app': 'order-service'})
+                    self.assertEqual(document['spec']['template']['metadata']['labels'], {'app': 'order-service'})
+                else:
+                    self.assertEqual(document['spec']['selector'], {'app': 'order-service'})
+        p.publish(api, plan)
+        pr = next(data for method, path, data in api.calls if method == 'POST' and path.endswith('/pulls'))
+        self.assertTrue(pr['title'].startswith('Promote order-service to dev:'))
+
+    def test_new_artifact_promotes_through_all_environments(self):
+        self.select_artifact('order-service')
+        for target, previous in [('uat', 'dev'), ('preprod', 'uat'), ('prod', 'preprod')]:
+            self.env['TARGET_ENV'] = target
+            with self.subTest(target=target):
+                plan = self.prepare(self.prior(previous))
+                self.assertTrue(all(e['path'].startswith(self.root + '/' + target + '/') or
+                                    e['path'] == f'argocd/applications/order-service-{target}.yaml'
+                                    for e in plan['entries']))
+
+    def test_another_artifact_release_cannot_satisfy_previous_environment(self):
+        api = self.prior('dev')
+        self.select_artifact('order-service')
+        self.env['TARGET_ENV'] = 'uat'
+        with self.assertRaisesRegex(ValueError, 'promote there first'):
+            self.prepare(api)
+        self.assertTrue(all(method == 'GET' for method, _, _ in api.calls))
+
+    def test_rejects_invalid_or_mismatched_artifact_before_github_calls(self):
+        for name in ('../prod', '', 'OrderService', 'order_service', 'order.service',
+                     '1order', '-order', 'order-', 'a' * 64, None, 'other-app'):
+            api = self.fixture()
+            labels = {**self.labels, 'org.opencontainers.image.title': name}
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                p.prepare(api, self.env, labels)
+            self.assertEqual(api.calls, [])
+        for name in ('a', 'a' * 63, 'order-service-2'):
+            with self.subTest(valid=name):
+                self.assertEqual(p.artifact_id({'org.opencontainers.image.title': name},
+                                              'harbor.core.com/library/' + name), name)
+
+    def test_old_literal_resource_names_remain_supported_for_same_artifact(self):
+        api = self.fixture()
+        for sha in ('source-dev', 'service-dev'):
+            api.blobs[sha]['metadata']['name'] = 'k8s-demo-app'
+        self.assertEqual(self.prepare(api)['release']['artifactId'], 'k8s-demo-app')
+
+    def test_wrong_resource_name_rejected_for_new_artifact(self):
+        self.select_artifact('order-service')
+        for sha in ('source-dev', 'service-dev'):
+            api = self.fixture()
+            api.blobs[sha]['metadata']['name'] = 'k8s-demo-app'
+            with self.subTest(sha=sha), self.assertRaisesRegex(ValueError, 'order-service'):
+                self.prepare(api)
+
+    def test_real_templates_support_existing_and_future_artifacts(self):
+        root = Path(__file__).resolve().parents[1]
+        for artifact in ('k8s-demo-app', 'order-service'):
+            self.select_artifact(artifact)
+            api = self.fixture()
+            for item in api.source_files:
+                api.blobs[item['sha']] = json.loads((root / item['path']).read_text())
+            bundle, digest = p.source_manifests(api, self.env['APP_REPO'], 'source-tree',
+                self.env['IMAGE_REPOSITORY'] + '@' + self.env['IMAGE_DIGEST'], artifact)
+            self.assertRegex(digest, r'^sha256:[a-f0-9]{64}$')
+            for target, documents in bundle.items():
+                deployment = documents['deployment.json']
+                service = documents['service.json']
+                self.assertEqual(deployment['metadata']['name'], artifact)
+                self.assertEqual(service['metadata']['name'], artifact)
+                self.assertEqual(deployment['metadata']['namespace'], target)
+                self.assertEqual(service['spec']['selector'], deployment['spec']['selector']['matchLabels'])
+                self.assertEqual(service['spec']['selector'], deployment['spec']['template']['metadata']['labels'])
+                self.assertNotIn('${ARTIFACT_ID}', json.dumps(documents))
+
+    def test_configuration_is_read_from_image_commit_not_branch(self):
+        api = self.fixture()
+        api.files = []
+        plan = self.prepare(api)
+        self.assertEqual(len(plan['entries']), 4)
+        reads = [path for method, path, _ in api.calls if method == 'GET']
+        self.assertIn('repos/owner/app/commits/' + 'a' * 40, reads)
+        self.assertIn('repos/owner/app/git/trees/source-tree?recursive=1', reads)
+        self.assertFalse(any('repos/owner/app/git/ref/heads/' in path for path in reads))
+
+    def test_rejects_prior_service_configuration_drift(self):
+        self.env['TARGET_ENV'] = 'uat'
+        api = self.prior('dev')
+        api.blobs['prior-service']['spec']['ports'][0]['port'] = 8080
+        with self.assertRaisesRegex(ValueError, 'source configuration'):
+            self.prepare(api)
+
+    def test_configuration_changes_are_recorded_with_same_image_digest(self):
+        api = self.fixture()
+        first = self.prepare(api)
+        api.blobs['source-prod']['spec']['replicas'] = 10
+        second = self.prepare(api)
+        self.assertEqual(first['release']['imageDigest'], second['release']['imageDigest'])
+        self.assertNotEqual(first['release']['configDigest'], second['release']['configDigest'])
 
     def test_registry_digest_is_verified(self):
         config = self.directory / 'docker.json'
