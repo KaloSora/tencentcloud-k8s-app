@@ -146,7 +146,10 @@ and it never executes application-revision scripts. A missing configuration is
 an error; there is no fallback to GitOps or a newer branch.
 
 The supported files are exactly `deployment.json` (`apps/v1` Deployment) and
-`service.json` (`v1` internal ClusterIP Service), both named `k8s-demo-app`.
+`service.json` (`v1` internal ClusterIP Service), both named after the Maven
+artifactId. Use the literal `${ARTIFACT_ID}` token in JSON string values for
+resource names, labels, selectors and application-specific references; promotion
+substitutes it with the artifactId without executing templates or scripts.
 Other files inside the manifests directories, symlinks and executable files are
 rejected. These checks validate the supported structure, not the complete
 Kubernetes API schema. The Deployment must contain exactly one container named
@@ -163,7 +166,7 @@ GitOps files: a later promotion replaces destination settings with the source
 configuration. Argo CD projects, namespace lifecycle and credentials retain
 platform ownership; do not put secrets in these JSON files.
 
-`release.json` records the image, source commit, Jira key, version and
+`release.json` records the artifactId, image, source commit, Jira key, version and
 `configDigest`. The latter is a SHA-256 of the canonical rendered configuration
 bundle for **all four environments**, including the resolved image and namespaces.
 This common identity allows each environment to have different replica counts or
@@ -174,6 +177,42 @@ Promote in order `dev → uat → preprod → prod`. Higher environments require
 same release identity in the preceding environment, and its Deployment and
 Service must still match that commit's rendered configuration. Jenkins checks
 Git declarations; verify the actual environment's health before continuing.
+
+### ArtifactId-based GitOps paths
+
+The build already records the effective Maven `project.artifactId` in the image's
+`org.opencontainers.image.title` label. Promotion obtains the artifactId from this
+verified image metadata, requires it to match the final image repository component,
+and generates these paths and names automatically:
+
+```text
+apps/<artifactId>/environments/<environment>/manifests/deployment.json
+apps/<artifactId>/environments/<environment>/manifests/service.json
+apps/<artifactId>/environments/<environment>/release.json
+argocd/applications/<artifactId>-<environment>.yaml
+```
+
+The Argo CD Application is named `<artifactId>-<environment>`. Deployment and
+Service names must equal `<artifactId>` after token substitution. The primary
+container remains named `app`. For example, `artifactId=order-service` generates
+`apps/order-service/environments/dev/` and Application `order-service-dev`.
+The source directory stays `deploy/environments/` for every project.
+
+For a new project, set its artifactId in `pom.xml`, retain the tokenized deployment
+configuration and build a new image; no promotion path changes or artifactId
+parameter are required. IDs must be 1–63 lowercase letters, digits or hyphens,
+start with a letter and end with a letter or digit, so they are valid Service
+names. Other valid Maven IDs (for example IDs with dots or underscores) are
+rejected by promotion. Choose a unique artifactId in this GitOps repository:
+paths are keyed by artifactId, not groupId. Renaming an artifact creates a new
+application path; it does not delete or migrate the old application.
+
+The current trusted promotion job still validates image source against its
+configured `APP_REPO` (`KaloSora/tencentcloud-k8s-app`). When reusing the pipeline
+for a separate source repository, configure that value in its trusted Jenkinsfile
+and grant its credential read access. Do not infer a trusted repository from an
+arbitrary image label. This flow expects one application and one `deploy/` bundle
+per source commit; Maven multi-module bundle discovery is not implemented.
 
 ### First promotion and migration
 
@@ -192,7 +231,7 @@ Git declarations; verify the actual environment's health before continuing.
 
 Existing GitOps manifests can remain until each environment is promoted. Their
 configuration is replaced by the app-owned files for that environment. Existing
-release records without `configDigest` must be replaced by a new `dev` promotion
+release records without `artifactId` or `configDigest` must be replaced by a new `dev` promotion
 and subsequent promotions in order. Existing unreleased Argo CD Applications
 should not be manually synced before their first real promotion. Promotion
 enables automatic sync (`prune: false`, `selfHeal: true`) for its target only.
