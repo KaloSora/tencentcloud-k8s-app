@@ -10,7 +10,7 @@ pipeline {
         GITOPS_REPO = 'KaloSora/tencentcloud-k8s-gitops'
         GITOPS_BRANCH = 'main'
         APP_REPO = 'KaloSora/tencentcloud-k8s-app'
-        GITOPS_CREDENTIALS_ID = 'gitops-github-token'
+        GITOPS_CREDENTIALS_ID = "${env.JENKINS_GITOPS_CREDENTIALS_ID ?: 'gitops-github-token'}"
     }
 
     parameters {
