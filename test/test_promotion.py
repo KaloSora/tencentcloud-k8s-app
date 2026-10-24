@@ -9,7 +9,8 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 
 
-spec = importlib.util.spec_from_file_location('promotion', Path(__file__).with_name('promotion.py'))
+spec = importlib.util.spec_from_file_location(
+    'promotion', Path(__file__).resolve().parents[1] / 'ci' / 'jenkins' / 'promotion.py')
 p = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(p)
 
@@ -262,6 +263,38 @@ class PromotionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Unexpected Harbor token endpoint'):
                 p.check_image(self.env['IMAGE_REPOSITORY'], self.env['IMAGE_DIGEST'], str(config))
             self.assertEqual(request.call_count, 1)
+
+    def test_registry_404_identifies_failed_operation_and_image(self):
+        config = self.directory / 'docker.json'
+        config.write_text(json.dumps({'auths': {'harbor.core.com': {'auth': 'dXNlcjpwYXNz'}}}))
+        manifest = b'{"config":{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+        digest = 'sha256:' + hashlib.sha256(manifest).hexdigest()
+
+        class Response:
+            def __init__(self, data): self.data = data
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self): return self.data
+
+        challenge = HTTPError('http://harbor.core.com', 401, 'Unauthorized',
+                              {'WWW-Authenticate': 'Bearer realm="http://harbor.core.com/service/token"'}, None)
+        for operation, responses in (
+                ('manifest fetch', []),
+                ('manifest fetch', [challenge, Response(b'{"token":"test-token"}')]),
+                ('token fetch', [challenge]),
+                ('config blob fetch', [Response(manifest)])):
+            with self.subTest(operation=operation, requests=len(responses)):
+                missing = HTTPError('http://harbor.core.com', 404, 'Not Found', {}, None)
+                with patch.object(p, 'urlopen', side_effect=responses + [missing]):
+                    with self.assertRaises(ValueError) as raised:
+                        p.check_image(self.env['IMAGE_REPOSITORY'], digest, str(config))
+                message = str(raised.exception)
+                self.assertIn(f'Harbor {operation} failed', message)
+                self.assertIn(self.env['IMAGE_REPOSITORY'] + '@' + digest, message)
+                self.assertIn('HTTP 404', message)
+                self.assertEqual('build/image-ref.txt' in message, operation == 'manifest fetch')
+                self.assertNotIn('dXNlcjpwYXNz', message)
+                self.assertNotIn('test-token', message)
 
     def test_registry_bearer_authentication(self):
         config = self.directory / 'docker.json'
