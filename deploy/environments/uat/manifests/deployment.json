@@ -1,0 +1,95 @@
+{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {
+    "name": "k8s-demo-app",
+    "labels": {
+      "app.kubernetes.io/name": "k8s-demo-app"
+    },
+    "namespace": "uat"
+  },
+  "spec": {
+    "replicas": 2,
+    "selector": {
+      "matchLabels": {
+        "app.kubernetes.io/name": "k8s-demo-app"
+      }
+    },
+    "template": {
+      "metadata": {
+        "labels": {
+          "app.kubernetes.io/name": "k8s-demo-app"
+        }
+      },
+      "spec": {
+        "securityContext": {
+          "runAsNonRoot": true,
+          "runAsUser": 10001,
+          "runAsGroup": 10001,
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
+        },
+        "containers": [
+          {
+            "name": "app",
+            "image": "harbor.core.com/library/com.tencentcloud.k8s.app/k8s-demo-app:unreleased",
+            "imagePullPolicy": "IfNotPresent",
+            "ports": [
+              {
+                "name": "http",
+                "containerPort": 18080
+              }
+            ],
+            "env": [
+              {
+                "name": "PORT",
+                "value": "18080"
+              }
+            ],
+            "readinessProbe": {
+              "httpGet": {
+                "path": "/readyz",
+                "port": "http"
+              },
+              "initialDelaySeconds": 2,
+              "periodSeconds": 5
+            },
+            "livenessProbe": {
+              "httpGet": {
+                "path": "/healthz",
+                "port": "http"
+              },
+              "initialDelaySeconds": 5,
+              "periodSeconds": 10
+            },
+            "resources": {
+              "requests": {
+                "cpu": "50m",
+                "memory": "64Mi"
+              },
+              "limits": {
+                "cpu": "500m",
+                "memory": "256Mi"
+              }
+            },
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ]
+              }
+            }
+          }
+        ],
+        "automountServiceAccountToken": false,
+        "imagePullSecrets": [
+          {
+            "name": "harbor-docker-config"
+          }
+        ]
+      }
+    }
+  }
+}

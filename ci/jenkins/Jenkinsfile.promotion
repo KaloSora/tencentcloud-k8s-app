@@ -61,11 +61,13 @@ pipeline {
         stage('Checkout Trusted Pipeline') {
             steps {
                 container('git') {
+                    // Pipeline code comes from trusted SCM. Deployment JSON is fetched
+                    // separately at the image's sourceCommit, never from this checkout.
                     checkout scm
                 }
             }
         }
-        stage('Prepare Promotion') {
+        stage('Prepare Image and Configuration Promotion') {
             steps {
                 withCredentials([string(credentialsId: env.GITOPS_CREDENTIALS_ID, variable: 'GITHUB_TOKEN')]) {
                     sh 'python3 ci/jenkins/promotion.py prepare'

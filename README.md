@@ -103,9 +103,11 @@ the build. Base images still come from the registries specified in the Dockerfil
 ## Deploy to Kubernetes
 
 Deployments are managed through Jenkins promotion and Argo CD. Environment
-Deployment and Service manifests are maintained in the
+Deployment and Service source manifests are maintained alongside the code in
+`deploy/environments/<environment>/manifests/`. Promotion generates the target
+environment files in
 [`tencentcloud-k8s-gitops`](https://github.com/KaloSora/tencentcloud-k8s-gitops)
-repository.
+and opens a PR; Argo CD continues to watch that repository.
 
 ### Jenkins promotion parameters and Harbor 404 errors
 
@@ -126,24 +128,74 @@ A manifest HTTP 404 means the requested repository/digest could not be fetched;
 check the paired artifacts and whether Harbor still retains the image.
 The diagnostic identifies manifest, token, or config blob requests separately.
 
-### Initialize environment configuration in GitOps
+### Application-owned deployment configuration
 
-Application-specific Deployment and Service files are maintained in
-`tencentcloud-k8s-gitops` under
-`apps/k8s-demo-app/environments/<environment>/manifests/` for `dev`, `uat`,
-`preprod` and `prod`. Each environment maps to the namespace of the same name.
-Review and merge these baseline files into the GitOps repository's `main`
-branch before running promotion. The application repository does not own
-initialization templates, and the promotion job has no initialization mode.
+Maintain these files in the application repository for each of `dev`, `uat`,
+`preprod` and `prod`:
 
-Initial Argo CD Applications omit automatic sync because the baseline uses an
-`:unreleased` placeholder image. Do not manually sync them before the first
-promotion. Run promotion to `dev` using a real image from a successful build;
-merging that PR replaces the placeholder with its verified digest, writes
-`release.json`, and enables automatic sync for the target environment.
-Continue in order `dev → uat → preprod → prod`. Ensure Terraform has created
-the namespaces and provision Harbor pull credentials in each namespace.
-Promotion preserves existing Deployment settings and Service configuration.
+```text
+deploy/environments/<environment>/manifests/deployment.json
+deploy/environments/<environment>/manifests/service.json
+```
+
+Commit code and deployment changes together before building the image. Promotion
+verifies the image metadata, resolves its full `sourceCommit` on GitHub, and reads
+all four environments from that exact commit's tree. It never uses the current
+application branch or the trusted pipeline checkout as the configuration source,
+and it never executes application-revision scripts. A missing configuration is
+an error; there is no fallback to GitOps or a newer branch.
+
+The supported files are exactly `deployment.json` (`apps/v1` Deployment) and
+`service.json` (`v1` internal ClusterIP Service), both named `k8s-demo-app`.
+Other files inside the manifests directories, symlinks and executable files are
+rejected. These checks validate the supported structure, not the complete
+Kubernetes API schema. The Deployment must contain exactly one container named
+`app`; sidecars and other settings are copied from the source configuration.
+Namespaces may be omitted or match the environment; promotion sets them
+explicitly. The `app` image is always replaced with the verified
+`repository@sha256:...`; source placeholder images are never deployed.
+
+Promotion atomically creates or replaces **only the target environment's**
+Deployment, Service, `release.json` and Argo CD Application through a GitOps PR.
+There is no need to seed the target's manifests manually. Edit replicas,
+resources, probes and other application configuration here, not in the generated
+GitOps files: a later promotion replaces destination settings with the source
+configuration. Argo CD projects, namespace lifecycle and credentials retain
+platform ownership; do not put secrets in these JSON files.
+
+`release.json` records the image, source commit, Jira key, version and
+`configDigest`. The latter is a SHA-256 of the canonical rendered configuration
+bundle for **all four environments**, including the resolved image and namespaces.
+This common identity allows each environment to have different replica counts or
+resources while ensuring the whole release is pinned. The resulting Git tree,
+not just the image digest, determines whether a promotion is unchanged.
+
+Promote in order `dev → uat → preprod → prod`. Higher environments require the
+same release identity in the preceding environment, and its Deployment and
+Service must still match that commit's rendered configuration. Jenkins checks
+Git declarations; verify the actual environment's health before continuing.
+
+### First promotion and migration
+
+1. Merge the pipeline changes into the trusted branch used by the promotion job.
+   Give its GitHub credential read access to the application repository in addition
+   to its existing GitOps write/PR access.
+2. Include `deploy/` in the application branch being built (currently `JIRA-*`),
+   commit it and build a **new image**. Images whose source commit predates these
+   files cannot use the new promotion flow. Configuration-only changes also need
+   a new build so that the image metadata points to the new source commit.
+3. Ensure Terraform has created the four namespaces, provision Harbor pull
+   credentials in each, and retain the existing Argo CD bootstrap and
+   `business-apps` project in GitOps.
+4. Promote to `dev`, review the generated manifests and merge the GitOps PR.
+   Then continue through the environments in order after checking deployment health.
+
+Existing GitOps manifests can remain until each environment is promoted. Their
+configuration is replaced by the app-owned files for that environment. Existing
+release records without `configDigest` must be replaced by a new `dev` promotion
+and subsequent promotions in order. Existing unreleased Argo CD Applications
+should not be manually synced before their first real promotion. Promotion
+enables automatic sync (`prune: false`, `selfHeal: true`) for its target only.
 
 Run the Python regression tests with:
 

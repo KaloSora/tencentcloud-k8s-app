@@ -8,3 +8,4 @@ target/*
 ci
 k8s
 README.md
+deploy
