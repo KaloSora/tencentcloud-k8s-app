@@ -142,5 +142,13 @@ printf '%s\n' "${IMAGE_REF}" > build/image-ref.txt
                 echo "Published image: ${env.IMAGE_REF}"
             }
         }
+
+        stage('Image Signing') {
+            steps {
+                // TODO: Integrate container image signing.
+                echo 'Image signing placeholder: signing integration is planned.'
+                sleep time: 3, unit: 'SECONDS'
+            }
+        }
     }
 }
